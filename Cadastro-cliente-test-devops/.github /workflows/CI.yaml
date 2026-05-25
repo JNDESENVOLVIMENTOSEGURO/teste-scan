@@ -1,0 +1,147 @@
+name: Security Scan
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  trigger-scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Gerar token do GitHub App
+        id: app-token
+        shell: bash
+        run: |
+          echo "🔐 Gerando token do GitHub App..."
+          APP_ID="${{ secrets.JNDEVSEC_APP_ID }}"
+          PRIVATE_KEY="${{ secrets.JNDEVSEC_APP_PRIVATE_KEY }}"
+
+          if [ -z "$APP_ID" ]; then echo "❌ Secret JNDEVSEC_APP_ID não configurado"; exit 1; fi
+          if [ -z "$PRIVATE_KEY" ]; then echo "❌ Secret JNDEVSEC_APP_PRIVATE_KEY não configurado"; exit 1; fi
+
+          NOW=$(date +%s)
+          IAT=$((NOW - 60))
+          EXP=$((NOW + 540))
+
+          HEADER=$(echo -n '{"alg":"RS256","typ":"JWT"}' | base64 -w0 | tr '+/' '-_' | tr -d '=')
+          PAYLOAD=$(echo -n "{\"iat\":$IAT,\"exp\":$EXP,\"iss\":\"$APP_ID\"}" | base64 -w0 | tr '+/' '-_' | tr -d '=')
+          UNSIGNED="$HEADER.$PAYLOAD"
+
+          SIGNATURE=$(echo -n "$UNSIGNED" | \
+            openssl dgst -sha256 -sign <(echo "$PRIVATE_KEY") | \
+            base64 -w0 | tr '+/' '-_' | tr -d '=')
+
+          JWT="$UNSIGNED.$SIGNATURE"
+
+          # Pega Installation ID
+          INSTALL_ID=$(curl -s \
+            -H "Authorization: Bearer $JWT" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/installation" \
+            | jq -r '.id')
+
+          if [ -z "$INSTALL_ID" ] || [ "$INSTALL_ID" = "null" ]; then
+            echo "❌ Falha ao obter Installation ID"
+            exit 1
+          fi
+          echo "✅ Installation ID: $INSTALL_ID"
+
+          # Gera token de instalação
+          TOKEN=$(curl -s \
+            -X POST \
+            -H "Authorization: Bearer $JWT" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/app/installations/$INSTALL_ID/access_tokens" \
+            | jq -r '.token')
+
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+            echo "❌ Falha ao gerar token de instalação"
+            exit 1
+          fi
+
+          echo "✅ Token gerado com sucesso"
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+          echo "install_id=$INSTALL_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Disparar scan no JNDEVSEC
+        run: |
+          echo "🚀 Disparando scan para commit ${{ github.sha }}..."
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            -H "Authorization: token ${{ steps.app-token.outputs.token }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/JNDEVSEC/security-templates/actions/workflows/security_scan.yml/dispatches" \
+            -d "{
+              \"ref\": \"main\",
+              \"inputs\": {
+                \"client_repo\": \"${{ github.repository }}\",
+                \"client_sha\": \"${{ github.sha }}\",
+                \"installation_id\": \"${{ steps.app-token.outputs.install_id }}\"
+              }
+            }")
+
+          HTTP=$(echo "$RESPONSE" | tail -1)
+          if [ "$HTTP" = "204" ]; then
+            echo "✅ Scan disparado com sucesso"
+          else
+            echo "❌ Falha ao disparar scan — HTTP $HTTP"
+            echo "$RESPONSE"
+            exit 1
+          fi
+
+      - name: Aguardar resultado do Security Gate
+        run: |
+          echo "⏳ Aguardando início do scan (60s)..."
+          sleep 60
+
+          echo "🔍 Iniciando polling para commit ${{ github.sha }}..."
+
+          for i in $(seq 1 40); do
+            echo "--- Tentativa $i/40 ---"
+
+            RESPONSE=$(curl -s \
+              -H "Authorization: token ${{ steps.app-token.outputs.token }}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/commits/${{ github.sha }}/check-runs")
+
+            TOTAL=$(echo "$RESPONSE" | jq '.check_runs | length' 2>/dev/null || echo "0")
+            echo "Checks encontrados: $TOTAL"
+
+            if [ "$TOTAL" = "0" ]; then
+              echo "⏳ Check ainda não criado, aguardando 30s..."
+              sleep 30
+              continue
+            fi
+
+            STATUS=$(echo "$RESPONSE" | jq -r \
+              '[.check_runs[] | select(.name=="JNDEVSEC Security Scan")] | first | .status // "not_found"')
+            CONCLUSION=$(echo "$RESPONSE" | jq -r \
+              '[.check_runs[] | select(.name=="JNDEVSEC Security Scan")] | first | .conclusion // "pending"')
+
+            echo "Status: $STATUS | Conclusion: $CONCLUSION"
+
+            if [ "$STATUS" = "not_found" ] || [ "$STATUS" = "null" ]; then
+              echo "⏳ Check ainda não criado, aguardando 30s..."
+              sleep 30
+              continue
+            fi
+
+            if [ "$STATUS" = "completed" ]; then
+              if [ "$CONCLUSION" = "success" ] || [ "$CONCLUSION" = "neutral" ]; then
+                echo "✅ Security gate passou!"
+                exit 0
+              else
+                echo "❌ Security gate falhou — merge bloqueado."
+                exit 1
+              fi
+            fi
+
+            echo "⏳ Status: $STATUS — aguardando 30s..."
+            sleep 30
+          done
+
+          echo "⏱️ Timeout — scan demorou mais de 20 minutos."
+          exit 1
