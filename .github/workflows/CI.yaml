@@ -1,4 +1,5 @@
 name: Security Scan
+
 on:
   push:
     branches: [ main ]
@@ -35,7 +36,7 @@ jobs:
 
           JWT="$UNSIGNED.$SIGNATURE"
 
-          # Pega Installation ID
+          # Pega Installation ID do repo do cliente
           INSTALL_ID=$(curl -s \
             -H "Authorization: Bearer $JWT" \
             -H "Accept: application/vnd.github+json" \
@@ -48,29 +49,57 @@ jobs:
           fi
           echo "✅ Installation ID: $INSTALL_ID"
 
-          # Gera token de instalação
-          TOKEN=$(curl -s \
+          # Gera token com acesso ao repo do cliente (para polling dos checks)
+          CLIENT_TOKEN=$(curl -s \
             -X POST \
             -H "Authorization: Bearer $JWT" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/app/installations/$INSTALL_ID/access_tokens" \
             | jq -r '.token')
 
-          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
-            echo "❌ Falha ao gerar token de instalação"
+          if [ -z "$CLIENT_TOKEN" ] || [ "$CLIENT_TOKEN" = "null" ]; then
+            echo "❌ Falha ao gerar token do cliente"
             exit 1
           fi
+          echo "✅ Token do cliente gerado"
 
-          echo "✅ Token gerado com sucesso"
-          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+          # Pega Installation ID do repo JNDEVSEC/security-templates
+          JNDEVSEC_INSTALL_ID=$(curl -s \
+            -H "Authorization: Bearer $JWT" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/JNDEVSEC/security-templates/installation" \
+            | jq -r '.id')
+
+          if [ -z "$JNDEVSEC_INSTALL_ID" ] || [ "$JNDEVSEC_INSTALL_ID" = "null" ]; then
+            echo "❌ Falha ao obter Installation ID do JNDEVSEC"
+            exit 1
+          fi
+          echo "✅ JNDEVSEC Installation ID: $JNDEVSEC_INSTALL_ID"
+
+          # Gera token com acesso ao repo JNDEVSEC/security-templates
+          JNDEVSEC_TOKEN=$(curl -s \
+            -X POST \
+            -H "Authorization: Bearer $JWT" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/app/installations/$JNDEVSEC_INSTALL_ID/access_tokens" \
+            | jq -r '.token')
+
+          if [ -z "$JNDEVSEC_TOKEN" ] || [ "$JNDEVSEC_TOKEN" = "null" ]; then
+            echo "❌ Falha ao gerar token JNDEVSEC"
+            exit 1
+          fi
+          echo "✅ Token JNDEVSEC gerado"
+
+          echo "client_token=$CLIENT_TOKEN" >> "$GITHUB_OUTPUT"
+          echo "jndevsec_token=$JNDEVSEC_TOKEN" >> "$GITHUB_OUTPUT"
           echo "install_id=$INSTALL_ID" >> "$GITHUB_OUTPUT"
 
       - name: Disparar scan no JNDEVSEC
         run: |
           echo "🚀 Disparando scan para commit ${{ github.sha }}..."
 
-          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
-            -H "Authorization: token ${{ steps.app-token.outputs.token }}" \
+          HTTP=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+            -H "Authorization: token ${{ steps.app-token.outputs.jndevsec_token }}" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/JNDEVSEC/security-templates/actions/workflows/security_scan.yml/dispatches" \
             -d "{
@@ -82,12 +111,10 @@ jobs:
               }
             }")
 
-          HTTP=$(echo "$RESPONSE" | tail -1)
           if [ "$HTTP" = "204" ]; then
             echo "✅ Scan disparado com sucesso"
           else
             echo "❌ Falha ao disparar scan — HTTP $HTTP"
-            echo "$RESPONSE"
             exit 1
           fi
 
@@ -102,7 +129,7 @@ jobs:
             echo "--- Tentativa $i/40 ---"
 
             RESPONSE=$(curl -s \
-              -H "Authorization: token ${{ steps.app-token.outputs.token }}" \
+              -H "Authorization: token ${{ steps.app-token.outputs.client_token }}" \
               -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/${{ github.repository }}/commits/${{ github.sha }}/check-runs")
 
@@ -119,6 +146,10 @@ jobs:
               '[.check_runs[] | select(.name=="JNDEVSEC Security Scan")] | first | .status // "not_found"')
             CONCLUSION=$(echo "$RESPONSE" | jq -r \
               '[.check_runs[] | select(.name=="JNDEVSEC Security Scan")] | first | .conclusion // "pending"')
+            TITLE=$(echo "$RESPONSE" | jq -r \
+              '[.check_runs[] | select(.name=="JNDEVSEC Security Scan")] | first | .output.title // ""')
+            SUMMARY=$(echo "$RESPONSE" | jq -r \
+              '[.check_runs[] | select(.name=="JNDEVSEC Security Scan")] | first | .output.summary // ""')
 
             echo "Status: $STATUS | Conclusion: $CONCLUSION"
 
@@ -129,11 +160,22 @@ jobs:
             fi
 
             if [ "$STATUS" = "completed" ]; then
+              echo ""
+              echo "======================================"
+              echo "🔒 SECURITY GATE RESULT"
+              echo "======================================"
+              echo "$TITLE"
+              echo "$SUMMARY"
+              echo "======================================"
+
               if [ "$CONCLUSION" = "success" ] || [ "$CONCLUSION" = "neutral" ]; then
-                echo "✅ Security gate passou!"
+                echo "✅ Security gate passou — merge liberado!"
                 exit 0
               else
-                echo "❌ Security gate falhou — merge bloqueado."
+                echo "❌ Security gate falhou — merge bloqueado!"
+                echo "## 🔒 Security Gate — Bloqueado" >> "$GITHUB_STEP_SUMMARY"
+                echo "$TITLE" >> "$GITHUB_STEP_SUMMARY"
+                echo "$SUMMARY" >> "$GITHUB_STEP_SUMMARY"
                 exit 1
               fi
             fi
